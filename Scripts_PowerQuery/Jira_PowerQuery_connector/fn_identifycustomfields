@@ -1,0 +1,78 @@
+// fn_IdentifyCustomFields - this is a function to identify the custom fields of a jiraboard and project
+// Final version with all confirmed field IDs
+
+() => 
+let
+    result = [
+        // Story Points - CONFIRMED 
+        StoryPoints = [
+            id = "customfield_10792", 
+            name = "Story Points", 
+            found = true
+        ],
+        
+        // Sprint - CONFIRMED 
+        Sprint = [
+            id = "customfield_12530", 
+            name = "Sprint", 
+            found = true
+        ],
+        
+        // Team field - UPDATED TO CORRECT FIELD 
+        Team = [
+            id = "customfield_10621",  // Changed from customfield_11261
+            name = "Team",
+            found = true
+        ],
+        
+        // Standard Jira fields
+        Assignee = [id = "assignee", name = "Assignee", found = true],
+        Status = [id = "status", name = "Status", found = true],
+        IssueType = [id = "issuetype", name = "Issue Type", found = true],
+        Summary = [id = "summary", name = "Summary", found = true],
+        Created = [id = "created", name = "Created", found = true],
+        Updated = [id = "updated", name = "Updated", found = true],
+        Project = [id = "project", name = "Project", found = true],
+        
+        // Updated fields for issue queries - using correct team field
+        FieldsForIssueQuery = "key,summary,status,assignee,issuetype,created,updated,project,customfield_10792,customfield_12530,customfield_10621",
+        
+        // Fields for changelog tracking
+        FieldsForChangelogTracking = {
+            "customfield_10792",  // Story Points changes
+            "customfield_12530",  // Sprint assignments  
+            "customfield_10621",  // Team changes (updated)
+            "status"              // Status transitions
+        },
+        
+        // JQL Examples - updated with correct team field
+        JQLExamples = [
+            AllIssuesWithSprints = "customfield_12530 is not EMPTY",
+            IssuesWithStoryPoints = "customfield_10792 is not EMPTY", 
+            AllTeamsWithData = "customfield_10621 is not EMPTY",  // Updated
+            RecentlyUpdated = "updated >= -7d",
+            CompleteIssues = "customfield_10792 is not EMPTY AND customfield_12530 is not EMPTY AND customfield_10621 is not EMPTY"
+        ],
+        
+        // ALL CRITICAL FIELDS NOW CONFIRMED 
+        AllCriticalFieldsFound = true,
+        MissingFields = {},
+        ConfigurationType = "All Fields Confirmed",
+        
+        // Alternative fields for reference
+        AlternativeFields = [
+            Team = [
+                ScrumTeam = "customfield_11261",  // The one we thought was primary
+                AssignedTeam = "customfield_26532",
+                ProjectTeam = "customfield_27630",
+                TeamsApp = "customfield_27530"
+            ],
+            StoryPoints = [
+                Original = "customfield_31330",
+                DevTeam = "customfield_37834", 
+                QATeam = "customfield_37835"
+            ]
+        ]
+    ]
+in
+    result
