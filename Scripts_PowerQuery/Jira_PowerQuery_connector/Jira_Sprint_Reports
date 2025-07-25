@@ -7,14 +7,14 @@ let
         StoryPointsField = "customfield_10792",
         SprintField = "customfield_12530",
         TeamField = "customfield_10621",
-        MerlinBoardId = 2660,
-        StackBoardId = 2658,
+        MerlinBoardId = {insertboardID},
+        StackBoardId = {insertboardID},
         SprintsPerTeam = 30,
-        ProjectKey = "MindTap (NG)",
+        ProjectKey = "{isertproject}",
         AnalysisStartDate = "2024-06-01",
         LastImportedDate = #datetime(2024, 07, 01, 0, 0, 0),
-        MerlinJqlFilter = "cf[10621] = ""Spartans Merlin""",
-        StackJqlFilter = "cf[10621] = ""Spartans Stack"""
+        MerlinJqlFilter = "cf[10621] = ""{InsertTeam}"",
+        StackJqlFilter = "cf[10621] = ""{InsertTeam2}"""
     ],
 
     CompleteFields = "key,summary,status,assignee,issuetype,created,updated,project," 
