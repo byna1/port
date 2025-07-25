@@ -1,0 +1,49 @@
+// This is a script to extract sprint information of a board
+
+let
+    // VARIÁVEIS
+    Token = "#token",
+    BoardID = "#boardid",
+    BaseUrl = "#jiradomain" & BoardID & "/sprint",
+
+    // Função para buscar página por offset
+    GetPage = (startAt as number) =>
+        let
+            Url = BaseUrl & "?startAt=" & Number.ToText(startAt) & "&maxResults=50",
+            Fonte = Json.Document(Web.Contents(Url,
+                [
+                    Headers = [
+                        Authorization = "Bearer " & Token,
+                        Accept = "application/json"
+                    ]
+                ])),
+            Valores = Fonte[values]
+        in
+            Valores,
+
+    // Geração das páginas até que venha uma lista vazia
+    AllPages = List.Generate(
+        () => [Start = 0, Page = GetPage(0)],
+        each List.Count([Page]) > 0,
+        each [Start = [Start] + 50, Page = GetPage([Start])],
+        each [Page]
+    ),
+
+    // Junta tudo numa lista única
+    Flattened = List.Combine(AllPages),
+
+    // Converte em tabela
+    Tabela = Table.FromList(Flattened, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+    Expand = Table.ExpandRecordColumn(Tabela, "Column1", {"id", "name", "state", "startDate", "endDate", "completeDate"}),
+    #"Split Column by Delimiter" = Table.SplitColumn(Expand, "startDate", Splitter.SplitTextByDelimiter("T", QuoteStyle.Csv), {"startDate.1", "startDate.2"}),
+    #"Changed Type" = Table.TransformColumnTypes(#"Split Column by Delimiter",{{"startDate.1", type date}, {"startDate.2", type text}}),
+    #"Removed Columns" = Table.RemoveColumns(#"Changed Type",{"startDate.2"}),
+    #"Split Column by Delimiter1" = Table.SplitColumn(#"Removed Columns", "completeDate", Splitter.SplitTextByDelimiter("T", QuoteStyle.Csv), {"completeDate.1", "completeDate.2"}),
+    #"Changed Type1" = Table.TransformColumnTypes(#"Split Column by Delimiter1",{{"completeDate.1", type date}, {"completeDate.2", type text}}),
+    #"Removed Columns1" = Table.RemoveColumns(#"Changed Type1",{"completeDate.2"}),
+    #"Reordered Columns" = Table.ReorderColumns(#"Removed Columns1",{"id", "name", "state", "startDate.1", "completeDate.1", "endDate"}),
+    #"Renamed Columns" = Table.RenameColumns(#"Reordered Columns",{{"startDate.1", "start_d"}, {"completeDate.1", "complete_d"}, {"id", "sprint_number"}}),
+    #"Changed Type2" = Table.TransformColumnTypes(#"Renamed Columns",{{"sprint_number", type text}, {"name", type text}}),
+    #"Removed Duplicates" = Table.Distinct(#"Changed Type2", {"sprint_number"})
+in
+    #"Removed Duplicates"
