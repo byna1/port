@@ -1,0 +1,536 @@
+// ========================================
+// **CONFIGURAÇÕES E CONSTANTES**
+// ========================================
+let
+    // Configurações de campos customizados
+    Config = [
+        StoryPointsField = "customfield_10792",
+        SprintField = "customfield_12530",
+        TeamField = "customfield_10621",
+        MerlinBoardId = 2660,
+        StackBoardId = 2658,
+        SprintsPerTeam = 30,
+        ProjectKey = "MindTap (NG)",
+        AnalysisStartDate = "2024-06-01",
+        LastImportedDate = #datetime(2024, 07, 01, 0, 0, 0),
+        MerlinJqlFilter = "cf[10621] = ""Spartans Merlin""",
+        StackJqlFilter = "cf[10621] = ""Spartans Stack"""
+    ],
+
+    CompleteFields = "key,summary,status,assignee,issuetype,created,updated,project," 
+                   & Config[StoryPointsField] & "," & Config[SprintField] & "," & Config[TeamField],
+
+    // ========================================
+    // **FUNÇÕES UTILITÁRIAS BASE**
+    // ========================================
+    
+    // Acesso seguro a campos
+    SafeGet = (record as record, fieldName as text, optional defaultValue as any) =>
+        if Record.HasFields(record, {fieldName}) 
+        then Record.Field(record, fieldName) 
+        else if defaultValue is null then null else defaultValue,
+
+    // Conversão robusta de datas do Jira
+    ParseJiraDate = (rawDate as any) as datetime =>
+        if rawDate = null or rawDate = "" then 
+            #datetime(1900,1,1,0,0,0)
+        else 
+            try DateTime.FromText(Text.From(rawDate))
+            otherwise try DateTime.From(rawDate)
+            otherwise try DateTimeZone.ToLocal(DateTimeZone.FromText(Text.From(rawDate)))
+            otherwise try 
+                let cleanDate = Text.Replace(Text.Replace(Text.From(rawDate), " +00:00", ""), " +0000", "")
+                in DateTime.FromText(cleanDate)
+            otherwise #datetime(1900,1,1,0,0,0),
+
+    // Verificação se sprint é nova (evita reprocessamento)
+    IsSprintNew = (sprintRecord as record) as logical =>
+        let sprintStart = ParseJiraDate(SafeGet(sprintRecord, "startDate"))
+        in sprintStart > Config[LastImportedDate],
+
+    // Extração de informações básicas de issue
+    ExtractIssueBasics = (issueRecord as record) as record => [
+        Key = issueRecord[key],
+        Summary = SafeGet(issueRecord[fields], "summary", ""),
+        Status = SafeGet(SafeGet(issueRecord[fields], "status", []), "name", ""),
+        StatusCategory = SafeGet(SafeGet(SafeGet(issueRecord[fields], "status", []), "statusCategory", []), "key", ""),
+        Assignee = SafeGet(SafeGet(issueRecord[fields], "assignee", []), "displayName", "Unassigned"),
+        IssueType = SafeGet(SafeGet(issueRecord[fields], "issuetype", []), "name", ""),
+        CurrentStoryPoints = try Number.From(Record.Field(issueRecord[fields], Config[StoryPointsField])) otherwise 0
+    ],
+
+    // ========================================
+    // **ANÁLISES DE CHANGELOG**
+    // ========================================
+
+    // Análise da linha do tempo dos Story Points
+    AnalyzeStoryPointsTimeline = (changelogTable as table, sprintStart as datetime, sprintEnd as datetime, currentPoints as number) as record =>
+        let
+            changelogRecords = Table.ToRecords(changelogTable),
+            
+            // Filtra mudanças de story points
+            pointsChanges = List.Select(changelogRecords, (change) =>
+                let fieldName = SafeGet(change, "Field", "")
+                in fieldName = "Story Points" or 
+                   fieldName = Config[StoryPointsField] or
+                   (Text.Contains(Text.Lower(fieldName), "story") and 
+                    Text.Contains(Text.Lower(fieldName), "point") and 
+                    not Text.Contains(Text.Lower(fieldName), "sprint"))
+            ),
+            
+            // Processa cada mudança
+            processedChanges = List.Transform(pointsChanges, (change) =>
+                let
+                    changeDate = ParseJiraDate(SafeGet(change, "ChangeDate", "")),
+                    fromVal = try Number.From(SafeGet(change, "FromValue", 0)) otherwise 0,
+                    toVal = try Number.From(SafeGet(change, "ToValue", 0)) otherwise 0,
+                    safeStart = if sprintStart = null then #datetime(1900,1,1,0,0,0) else sprintStart,
+                    safeEnd = if sprintEnd = null then #datetime(2100,1,1,0,0,0) else sprintEnd,
+                    isValid = changeDate <> #datetime(1900,1,1,0,0,0)
+                in [
+                    ChangeDate = changeDate,
+                    FromValue = fromVal,
+                    ToValue = toVal,
+                    IsValid = isValid,
+                    IsBefore = isValid and changeDate < safeStart,
+                    IsDuring = isValid and changeDate >= safeStart and changeDate <= safeEnd,
+                    IsAfter = isValid and changeDate > safeEnd
+                ]
+            ),
+            
+            validChanges = List.Select(processedChanges, each [IsValid]),
+            beforeChanges = List.Sort(List.Select(validChanges, each [IsBefore]), each -Number.From([ChangeDate])),
+            duringChanges = List.Sort(List.Select(validChanges, each [IsDuring]), each Number.From([ChangeDate])),
+            
+            // Calcula pontos no início e fim da sprint
+            pointsAtStart = if List.Count(beforeChanges) > 0 then 
+                              beforeChanges{0}[ToValue]
+                          else if List.Count(duringChanges) > 0 then 
+                              duringChanges{0}[FromValue]
+                          else currentPoints,
+                          
+            pointsAtEnd = if List.Count(duringChanges) > 0 then 
+                            List.Last(duringChanges)[ToValue]
+                        else pointsAtStart
+        in [
+            StoryPointsAtSprintStart = pointsAtStart,
+            StoryPointsAtSprintEnd = pointsAtEnd,
+            StoryPointsCurrentValue = currentPoints,
+            HadReestimationDuringSprint = List.Count(duringChanges) > 0,
+            NumberOfReestimations = List.Count(duringChanges),
+            TotalPointsVariationDuringSprint = pointsAtEnd - pointsAtStart
+        ],
+
+    // Análise de status de conclusão
+    AnalyzeCompletionStatus = (changelogTable as table, sprintEnd as datetime, currentStatus as text) as record =>
+        let
+            changelogRecords = Table.ToRecords(changelogTable),
+            
+            statusChanges = List.Select(changelogRecords, (change) =>
+                let fieldName = SafeGet(change, "Field", "") 
+                in fieldName = "status" or Text.Contains(Text.Lower(fieldName), "status")
+            ),
+            
+            processedChanges = List.Transform(statusChanges, (change) =>
+                let
+                    changeDate = ParseJiraDate(SafeGet(change, "ChangeDate", "")),
+                    toStatus = Text.Lower(Text.From(SafeGet(change, "ToValue", ""))),
+                    isValid = changeDate <> #datetime(1900,1,1,0,0,0),
+                    isBefore = isValid and changeDate <= sprintEnd,
+                    isDone = List.Contains({"done","closed","resolved","finished"}, toStatus) or 
+                             Text.Contains(toStatus, "done") or Text.Contains(toStatus, "closed")
+                in [
+                    ChangeDate = changeDate,
+                    ToStatus = toStatus,
+                    IsBeforeSprintEnd = isBefore,
+                    IsCompletionStatus = isDone
+                ]
+            ),
+            
+            validChanges = List.Select(processedChanges, each [IsBeforeSprintEnd]),
+            sortedChanges = List.Sort(validChanges, each -Number.From([ChangeDate])),
+            
+            finalStatus = if List.Count(sortedChanges) > 0 
+                         then sortedChanges{0}[ToStatus] 
+                         else Text.Lower(currentStatus),
+                         
+            wasDone = if List.Count(sortedChanges) > 0 
+                     then sortedChanges{0}[IsCompletionStatus] 
+                     else currentStatus = "done"
+        in [
+            WasCompletedAtSprintEnd = wasDone,
+            StatusAtSprintEnd = finalStatus
+        ],
+
+    // Análise de presença na sprint
+    AnalyzeSprintPresence = (changelogTable as table, targetSprint as text, sprintStart as datetime) as record =>
+        let
+            changelogRecords = Table.ToRecords(changelogTable),
+            
+            sprintChanges = List.Select(changelogRecords, (change) =>
+                SafeGet(change, "Field", "") = "Sprint" or SafeGet(change, "Field", "") = Config[SprintField]
+            ),
+            
+            processedChanges = List.Transform(sprintChanges, (change) =>
+                let
+                    changeDate = ParseJiraDate(SafeGet(change, "ChangeDate", "")),
+                    fromValue = Text.From(SafeGet(change, "FromValue", "")),
+                    toValue = Text.From(SafeGet(change, "ToValue", "")),
+                    wasAdded = not Text.Contains(fromValue, targetSprint) and Text.Contains(toValue, targetSprint),
+                    wasRemoved = Text.Contains(fromValue, targetSprint) and not Text.Contains(toValue, targetSprint),
+                    isBefore = changeDate < sprintStart,
+                    isAfter = changeDate >= sprintStart
+                in [
+                    ChangeDate = changeDate,
+                    Added = wasAdded,
+                    Removed = wasRemoved,
+                    Before = isBefore,
+                    After = isAfter
+                ]
+            ),
+            
+            additionsBefore = List.Select(processedChanges, each [Added] and [Before]),
+            removalsBefore = List.Select(processedChanges, each [Removed] and [Before]),
+            additionsAfter = List.Select(processedChanges, each [Added] and [After]),
+            removalsAfter = List.Select(processedChanges, each [Removed] and [After]),
+            
+            wasPresentAtStart = if List.Count(additionsBefore) > 0 then
+                                  if List.Count(removalsBefore) > 0 then
+                                      let
+                                          lastAdd = List.Max(List.Transform(additionsBefore, each [ChangeDate])),
+                                          lastRemoval = List.Max(List.Transform(removalsBefore, each [ChangeDate]))
+                                      in lastAdd > lastRemoval
+                                  else true
+                              else false
+        in [
+            WasPresentAtSprintStart = wasPresentAtStart,
+            WasAddedAfterSprintStart = List.Count(additionsAfter) > 0,
+            WasRemovedAfterSprintStart = List.Count(removalsAfter) > 0
+        ],
+
+    // Análise de issues removidas durante a sprint
+    AnalyzeRemovedIssues = (changelogTable as table, targetSprint as text, sprintStart as datetime, sprintEnd as datetime, currentPoints as number) as record =>
+        let
+            changelogRecords = Table.ToRecords(changelogTable),
+            
+            sprintChanges = List.Select(changelogRecords, (change) =>
+                SafeGet(change, "Field", "") = "Sprint" or SafeGet(change, "Field", "") = Config[SprintField]
+            ),
+            
+            processedChanges = List.Transform(sprintChanges, (change) =>
+                let
+                    changeDate = ParseJiraDate(SafeGet(change, "ChangeDate", "")),
+                    fromValue = Text.From(SafeGet(change, "FromValue", "")),
+                    toValue = Text.From(SafeGet(change, "ToValue", "")),
+                    wasAdded = Text.Contains(toValue, targetSprint) and not Text.Contains(fromValue, targetSprint),
+                    wasRemoved = Text.Contains(fromValue, targetSprint) and not Text.Contains(toValue, targetSprint),
+                    isDuring = changeDate >= sprintStart and changeDate <= sprintEnd
+                in [
+                    Added = wasAdded,
+                    Removed = wasRemoved,
+                    During = isDuring
+                ]
+            ),
+            
+            additionsDuring = List.Select(processedChanges, each [Added] and [During]),
+            removalsDuring = List.Select(processedChanges, each [Removed] and [During]),
+            
+            wasRemoved = List.Count(removalsDuring) > 0,
+            wasAlsoAdded = List.Count(additionsDuring) > 0,
+            
+            pointsAnalysis = AnalyzeStoryPointsTimeline(changelogTable, sprintStart, sprintEnd, currentPoints),
+            storyPointsRemoved = if wasRemoved then
+                                   if not wasAlsoAdded then 
+                                       pointsAnalysis[StoryPointsAtSprintStart]
+                                   else 
+                                       pointsAnalysis[StoryPointsAtSprintEnd]
+                               else 0
+        in [
+            WasRemovedFromSprint = wasRemoved,
+            WasAlsoAddedDuringSprint = wasAlsoAdded,
+            RemovedIssueLifecycleClassification = 
+                if wasRemoved and wasAlsoAdded then "Added Then Removed During Sprint"
+                else if wasRemoved then "Removed During Sprint (Was Present at Start)"
+                else "Not Removed",
+            StoryPointsWhenRemoved = storyPointsRemoved
+        ],
+
+    // ========================================
+    // **PROCESSAMENTO DE ISSUES E SPRINTS**
+    // ========================================
+
+    // Processamento completo de uma issue
+    ProcessIssue = (issueRecord as record, sprintData as record, isCurrentlyInSprint as logical) as record =>
+        let
+            basics = ExtractIssueBasics(issueRecord),
+            changelog = try fn_ParseChangelog(basics[Key]) otherwise Table.FromRecords({}),
+            
+            pointsAnalysis = AnalyzeStoryPointsTimeline(changelog, sprintData[ActivatedDate], sprintData[CompletedDate], basics[CurrentStoryPoints]),
+            completionAnalysis = AnalyzeCompletionStatus(changelog, sprintData[CompletedDate], basics[StatusCategory]),
+            presenceAnalysis = AnalyzeSprintPresence(changelog, sprintData[SprintName], sprintData[ActivatedDate]),
+            removalAnalysis = AnalyzeRemovedIssues(changelog, sprintData[SprintName], sprintData[ActivatedDate], sprintData[CompletedDate], basics[CurrentStoryPoints])
+        in
+            Record.Combine({
+                [
+                    IssueKey = basics[Key],
+                    Summary = basics[Summary],
+                    Status = basics[Status],
+                    StatusCategory = basics[StatusCategory],
+                    Assignee = basics[Assignee],
+                    IssueType = basics[IssueType],
+                    IsCurrentlyInSprint = isCurrentlyInSprint,
+                    SprintId = sprintData[SprintId],
+                    SprintName = sprintData[SprintName],
+                    Team = sprintData[Team]
+                ],
+                pointsAnalysis,
+                completionAnalysis,
+                presenceAnalysis,
+                removalAnalysis
+            }),
+
+    // Processamento de uma sprint completa
+    ProcessSprint = (sprintId as number, teamName as text, boardId as number) as list =>
+        let
+            // Carrega dados da sprint
+            sprintResponse = try fn_JiraAPI("agile/1.0/sprint/" & Text.From(sprintId), []) otherwise null,
+            
+            sprintData = if sprintResponse <> null then [
+                SprintId = sprintResponse[id],
+                SprintName = sprintResponse[name],
+                StartDate = ParseJiraDate(SafeGet(sprintResponse, "startDate")),
+                ActivatedDate = ParseJiraDate(SafeGet(sprintResponse, "activatedDate")),
+                EndDate = ParseJiraDate(SafeGet(sprintResponse, "endDate")),
+                CompletedDate = ParseJiraDate(SafeGet(sprintResponse, "completeDate")),
+                BoardId = boardId,
+                Team = teamName,
+                Goal = SafeGet(sprintResponse, "goal"),
+                SprintState = SafeGet(sprintResponse, "state", "unknown")
+            ] else null,
+            
+            // Issues atuais na sprint
+            currentIssuesResponse = try fn_JiraAPI("agile/1.0/sprint/" & Text.From(sprintId) & "/issue", [
+                fields = CompleteFields,
+                maxResults = "1000"
+            ]) otherwise null,
+            currentIssues = if currentIssuesResponse <> null then currentIssuesResponse[issues] else {},
+            
+            // Issues históricas para detectar removidas
+            teamFilter = if teamName = "Merlin" then Config[MerlinJqlFilter]
+                        else if teamName = "Stack" then Config[StackJqlFilter]
+                        else "cf[" & Text.Replace(Config[TeamField], "customfield_", "") & "] IS NOT EMPTY",
+                        
+            historicalJql = "project = """ & Config[ProjectKey] & """ AND " & teamFilter & " AND updated >= " & Config[AnalysisStartDate],
+            
+            historicalResponse = try fn_JiraAPI("api/2/search", [
+                jql = historicalJql,
+                fields = CompleteFields,
+                maxResults = "1000"
+            ]) otherwise null,
+            historicalIssues = if historicalResponse <> null then historicalResponse[issues] else {},
+            
+            // Processa issues atuais
+            processedCurrent = if sprintData <> null and List.Count(currentIssues) > 0 then
+                List.Transform(currentIssues, (issue) => ProcessIssue(issue, sprintData, true))
+            else {},
+            
+            // Processa issues removidas
+            processedRemoved = if sprintData <> null and List.Count(historicalIssues) > 0 then
+                let
+                    currentKeys = List.Transform(currentIssues, each [key]),
+                    candidateRemoved = List.Transform(historicalIssues, (issue) =>
+                        let
+                            issueKey = issue[key],
+                            isNotInCurrent = not List.Contains(currentKeys, issueKey),
+                            
+                            // Verificação rápida de remoção
+                            changelog = try fn_ParseChangelog(issueKey) otherwise Table.FromRecords({}),
+                            changelogRecords = Table.ToRecords(changelog),
+                            
+                            sprintChanges = List.Select(changelogRecords, (change) =>
+                                SafeGet(change, "Field", "") = "Sprint" or SafeGet(change, "Field", "") = Config[SprintField]
+                            ),
+                            
+                            hasRemoval = List.AnyTrue(List.Transform(sprintChanges, (change) =>
+                                let
+                                    changeDate = ParseJiraDate(SafeGet(change, "ChangeDate", "")),
+                                    fromValue = Text.From(SafeGet(change, "FromValue", "")),
+                                    toValue = Text.From(SafeGet(change, "ToValue", "")),
+                                    wasRemoved = Text.Contains(fromValue, sprintData[SprintName]) and not Text.Contains(toValue, sprintData[SprintName]),
+                                    duringPeriod = changeDate >= sprintData[ActivatedDate] and changeDate <= sprintData[CompletedDate]
+                                in wasRemoved and duringPeriod
+                            ))
+                        in
+                            if isNotInCurrent and hasRemoval then
+                                ProcessIssue(issue, sprintData, false)
+                            else null
+                    ),
+                    validRemoved = List.Select(candidateRemoved, each _ <> null)
+                in validRemoved
+            else {}
+        in
+            processedCurrent & processedRemoved,
+
+    // ========================================
+    // **CARREGAMENTO DE SPRINTS**
+    // ========================================
+
+    // Carrega todas as sprints de um board
+    LoadAllSprints = (boardId as number) as list =>
+        let
+            LoadSprintsPage = (startAt as number) =>
+                let
+                    response = fn_JiraAPI("agile/1.0/board/" & Text.From(boardId) & "/sprint", [
+                        state = "active,closed",
+                        startAt = Text.From(startAt),
+                        maxResults = "50"
+                    ]),
+                    values = response[values],
+                    isLast = response[isLast]
+                in [
+                    Values = values,
+                    IsLast = isLast,
+                    NextStart = startAt + List.Count(values)
+                ],
+            
+            LoadAllPages = (accumulated, startAt) =>
+                let
+                    page = LoadSprintsPage(startAt),
+                    newAccumulated = accumulated & page[Values]
+                in
+                    if page[IsLast] or List.Count(page[Values]) = 0 then 
+                        newAccumulated
+                    else 
+                        @LoadAllPages(newAccumulated, page[NextStart])
+        in
+            LoadAllPages({}, 0),
+
+    // Seleciona sprints recentes e fechadas
+    GetRecentClosedSprints = (allSprints as list, teamName as text) as list =>
+        let
+            closedSprints = List.Select(allSprints, (sprint) => SafeGet(sprint, "state", "") = "closed"),
+            sortedSprints = List.Sort(closedSprints, each -[id]),
+            recentSprints = List.FirstN(sortedSprints, Config[SprintsPerTeam]),
+            sprintsWithTeam = List.Transform(recentSprints, (sprint) => Record.AddField(sprint, "TeamName", teamName))
+        in
+            sprintsWithTeam,
+
+    // ========================================
+    // **EXECUÇÃO PRINCIPAL**
+    // ========================================
+
+    // Carrega sprints dos dois times
+    allMerlinSprints = try LoadAllSprints(Config[MerlinBoardId]) otherwise {},
+    allStackSprints = try LoadAllSprints(Config[StackBoardId]) otherwise {},
+
+    // Seleciona sprints recentes
+    merlinSprints = GetRecentClosedSprints(allMerlinSprints, "Merlin"),
+    stackSprints = GetRecentClosedSprints(allStackSprints, "Stack"),
+    allSelectedSprints = merlinSprints & stackSprints,
+
+    // Filtra apenas sprints novas para otimização
+    newSprintsOnly = List.Select(allSelectedSprints, each IsSprintNew(_)),
+
+    // Processa todas as sprints selecionadas
+    allSprintResults = List.Transform(newSprintsOnly, (sprint) =>
+        ProcessSprint(sprint[id], sprint[TeamName], 
+            if sprint[TeamName] = "Merlin" then Config[MerlinBoardId] else Config[StackBoardId]
+        )
+    ),
+
+    // Combina todos os resultados
+    allProcessedIssues = List.Combine(allSprintResults),
+
+    // ========================================
+    // **CRIAÇÃO DA TABELA FINAL**
+    // ========================================
+
+    CreateFinalTable = (processedIssues as list) as table =>
+        if List.Count(processedIssues) > 0 then
+            let
+                baseTable = Table.FromRecords(processedIssues),
+                
+                // Adiciona classificação geral
+                withClassification = Table.AddColumn(baseTable, "OverallClassification", each
+                    if [RemovedIssueLifecycleClassification] = "Added Then Removed During Sprint" then 
+                        "Complex Movement - Added Then Removed"
+                    else if [WasRemovedFromSprint] then 
+                        "Scope Reduction - Removed"
+                    else if [WasAddedAfterSprintStart] and [WasCompletedAtSprintEnd] then 
+                        "Scope Addition - Delivered"
+                    else if [WasAddedAfterSprintStart] and not [WasCompletedAtSprintEnd] then 
+                        "Scope Addition - Not Delivered"
+                    else if [WasPresentAtSprintStart] and [WasCompletedAtSprintEnd] then 
+                        "Original Scope - Delivered"
+                    else if [WasPresentAtSprintStart] and not [WasCompletedAtSprintEnd] then 
+                        "Original Scope - Not Delivered"
+                    else 
+                        "Other"),
+                
+                // Adiciona variação de pontos
+                withPointsVariation = Table.AddColumn(withClassification, "StoryPointsVariation", each 
+                    [StoryPointsAtSprintEnd] - [StoryPointsAtSprintStart]),
+                
+                // Adiciona percentual de variação
+                withVariationPercent = Table.AddColumn(withPointsVariation, "StoryPointsVariationPercent", each 
+                    if [StoryPointsAtSprintStart] = 0 then 0
+                    else ([StoryPointsAtSprintEnd] - [StoryPointsAtSprintStart]) / [StoryPointsAtSprintStart] * 100),
+                
+                // Adiciona flag de qualidade
+                withQualityFlag = Table.AddColumn(withVariationPercent, "AnalysisQualityFlag", each
+                    if [WasRemovedFromSprint] and [WasAlsoAddedDuringSprint] then 
+                        "Complex - Requires Review"
+                    else if [HadReestimationDuringSprint] then 
+                        "Standard - Reestimated"
+                    else 
+                        "Standard"),
+                
+                // Adiciona quarter
+                withQuarter = Table.AddColumn(withQualityFlag, "SprintQuarter", each
+                    let sprintName = Text.From([SprintName])
+                    in if Text.Contains(sprintName, "Q1") then "Q1"
+                       else if Text.Contains(sprintName, "Q2") then "Q2"
+                       else if Text.Contains(sprintName, "Q3") then "Q3"
+                       else if Text.Contains(sprintName, "Q4") then "Q4"
+                       else "Unknown"),
+                
+                // Aplica tipos de dados
+                ApplyColumnTypes = (tbl as table, columnName as text, targetType as type) as table =>
+                    if List.Contains(Table.ColumnNames(tbl), columnName) then
+                        Table.TransformColumns(tbl, {{columnName, each try Number.From(_) otherwise 0, targetType}})
+                    else tbl,
+                
+                numericColumns = {
+                    "StoryPointsAtSprintStart", "StoryPointsAtSprintEnd", "StoryPointsCurrentValue",
+                    "NumberOfReestimations", "TotalPointsVariationDuringSprint", "StoryPointsWhenRemoved", 
+                    "StoryPointsVariation"
+                },
+                
+                withNumbers = List.Accumulate(numericColumns, withQuarter, (state, col) => 
+                    ApplyColumnTypes(state, col, Int64.Type)),
+                
+                // Aplica tipos para campos de texto e lógicos
+                textLogicalTypes = List.Select({
+                    {"Summary", type text}, {"Status", type text}, {"StatusCategory", type text},
+                    {"Assignee", type text}, {"IssueType", type text}, {"Team", type text},
+                    {"SprintName", type text}, {"OverallClassification", type text},
+                    {"AnalysisQualityFlag", type text}, {"SprintQuarter", type text},
+                    {"WasPresentAtSprintStart", type logical}, {"WasAddedAfterSprintStart", type logical},
+                    {"WasRemovedAfterSprintStart", type logical}, {"WasCompletedAtSprintEnd", type logical},
+                    {"WasRemovedFromSprint", type logical}, {"WasAlsoAddedDuringSprint", type logical},
+                    {"HadReestimationDuringSprint", type logical}, {"IsCurrentlyInSprint", type logical}
+                }, each List.Contains(Table.ColumnNames(withNumbers), _{0})),
+                
+                finalTyped = if List.Count(textLogicalTypes) > 0 then
+                               Table.TransformColumnTypes(withNumbers, textLogicalTypes)
+                             else withNumbers
+            in
+                finalTyped
+        else
+            Table.FromColumns({}, {"IssueKey"}),
+
+    // Executa a criação da tabela final
+    finalResult = CreateFinalTable(allProcessedIssues)
+
+in
+    finalResult
