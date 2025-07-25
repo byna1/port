@@ -1,0 +1,85 @@
+let
+    // VARIÁVEIS
+    Token = "#token", // Substitua pelo seu token real 
+    BoardID = "#BoardID", // Substitua pelo ID do seu board
+    jira_instance_url = "#jiraurl", 
+
+     // URL base da API de sprints
+    BaseUrl = jira_instance_url & "/rest/agile/1.0/board/" & BoardID & "/sprint",
+
+    // Função para buscar uma página de sprints por offset
+    GetPage = (startAt as number) =>
+        let
+            Url = BaseUrl & "?startAt=" & Number.ToText(startAt) & "&maxResults=50",
+            Fonte = Json.Document(Web.Contents(Url,
+                [
+                    Headers = [
+                        Authorization = "Bearer " & Token,
+                        Accept = "application/json"
+                    ]
+                ])),
+            Valores = Fonte[values]
+        in
+            Valores,
+
+    // Loop para capturar todas as páginas de sprints
+    AllPages = List.Generate(
+        () => [Start = 0, Page = GetPage(0)],
+        each List.Count([Page]) > 0,
+        each [Start = [Start] + 50, Page = GetPage([Start])],
+        each [Page]
+    ),
+
+    // Junta todas as páginas em uma lista única
+    Flattened = List.Combine(AllPages),
+
+    // Converte para tabela e expande as colunas principais
+    TabelaSprints = Table.FromList(Flattened, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+    ExpandSprints = Table.ExpandRecordColumn(TabelaSprints, "Column1", {"id", "name", "state", "startDate", "endDate", "completeDate"}),
+
+    //  Função para buscar os Issues de cada Sprint via JQL
+    GetIssuesBySprint = (sprintId as text) =>
+    let
+        JqlUrl = jira_instance_url & "/rest/api/2/search?jql=sprint=" & sprintId & "&maxResults=1000&fields=summary,status,resolution,resolutiondate",
+        Source = Json.Document(Web.Contents(JqlUrl, 
+            [
+                Headers = [
+                    Authorization = "Bearer " & Token,
+                    Accept = "application/json"
+                ]
+            ]
+        )),
+        Issues = try Source[issues] otherwise {},
+        IssuesTable = Table.FromList(Issues, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+        ExpandedIssues = try Table.ExpandRecordColumn(IssuesTable, "Column1", {"key", "fields"}) otherwise IssuesTable,
+        ExpandedFields = try Table.ExpandRecordColumn(ExpandedIssues, "fields", {"summary", "status", "resolution", "resolutiondate"}) otherwise ExpandedIssues,
+        ExpandStatus = try Table.ExpandRecordColumn(ExpandedFields, "status", {"name"}) otherwise ExpandedFields,
+        
+        // 🧪 Extrai a resolução e a data de resolução
+        ExtractResolution = Table.AddColumn(ExpandStatus, "Resolution", each try [resolution][name] otherwise null),
+        ExtractResolutionDate = Table.AddColumn(ExtractResolution, "ResolutionDate", each try [resolutiondate] otherwise null)
+        
+    in
+        ExtractResolutionDate, // Retorna a tabela com resolução e data de resolução
+
+    // Aplica a função GetIssuesBySprint para cada ID de sprint
+    AllIssues = List.Transform(ExpandSprints[id], each GetIssuesBySprint(Text.From(_))),
+
+    // Junta tudo numa tabela final
+    CombinedIssues = Table.Combine(AllIssues),
+    #"Sorted Rows" = Table.Sort(CombinedIssues,{{"ResolutionDate", Order.Descending}}),
+    #"Split Column by Delimiter" = Table.SplitColumn(#"Sorted Rows", "ResolutionDate", Splitter.SplitTextByDelimiter("T", QuoteStyle.Csv), {"ResolutionDate.1", "ResolutionDate.2"}),
+    #"Changed Type" = Table.TransformColumnTypes(#"Split Column by Delimiter",{{"ResolutionDate.1", type date}, {"ResolutionDate.2", type time}}),
+    #"Renamed Columns" = Table.RenameColumns(#"Changed Type",{{"Resolution", "Resolution.1"}}),
+    #"Changed Type1" = Table.TransformColumnTypes(#"Renamed Columns",{{"ResolutionDate.1", type date}}),
+    #"Reordered Columns" = Table.ReorderColumns(#"Changed Type1",{"key", "summary", "name", "Resolution.1", "resolution", "resolutiondate", "ResolutionDate.1", "ResolutionDate.2"}),
+    #"Removed Columns" = Table.RemoveColumns(#"Reordered Columns",{"ResolutionDate.2"}),
+    #"Changed Type2" = Table.TransformColumnTypes(#"Removed Columns",{{"name", type text}, {"Resolution.1", type text}}),
+    #"Renamed Columns1" = Table.RenameColumns(#"Changed Type2",{{"ResolutionDate.1", "ResolutionD"}}),
+    #"Reordered Columns1" = Table.ReorderColumns(#"Renamed Columns1",{"key", "summary", "name", "Resolution.1", "resolution", "ResolutionD", "resolutiondate"}),
+    #"Renamed Columns2" = Table.RenameColumns(#"Reordered Columns1",{{"ResolutionD", "resolution_d"}, {"key", "issue_key"}}),
+    #"Changed Type3" = Table.TransformColumnTypes(#"Renamed Columns2",{{"issue_key", type text}, {"summary", type text}}),
+    #"Renamed Columns3" = Table.RenameColumns(#"Changed Type3",{{"Resolution.1", "issue_status"}}),
+    #"Removed Duplicates" = Table.Distinct(#"Renamed Columns3", {"issue_key"})
+in
+    #"Removed Duplicates"
