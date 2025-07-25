@@ -1,0 +1,99 @@
+// fn_ParseChangelog - Reusable function to extract and parse changelog data
+(issueKey as text) as table =>
+let
+    // Get custom field configuration
+    fieldConfig = fn_IdentifyCustomFields(),
+    
+    // Get issue with changelog
+    issueWithChangelog = fn_JiraAPI(
+        "api/2/issue/" & issueKey,
+        [
+            expand = "changelog",
+            fields = "key,summary,status"  // Only need minimal fields
+        ]
+    ),
+    
+    // Extract changelog entries
+    changelogEntries = try issueWithChangelog[changelog][histories] otherwise {},
+    
+    // Extract all field changes
+    allChanges = try
+        List.Combine(
+            List.Transform(
+                changelogEntries,
+                (history) => 
+                    List.Transform(
+                        history[items], 
+                        (item) => [
+                            IssueKey = issueKey,
+                            ChangeDate = history[created],
+                            Author = try history[author][displayName] otherwise "Unknown",
+                            Field = item[field],
+                            FieldType = try item[fieldtype] otherwise "Unknown",
+                            FromValue = try item[fromString] otherwise "",
+                            ToValue = try item[toString] otherwise ""
+                        ]
+                    )
+            )
+        )
+    otherwise {},
+    
+    // Convert to table
+    changesTable = Table.FromRecords(allChanges),
+    
+    // If no changes, create an empty table with the expected schema
+    emptyTable = #table(
+        {"IssueKey", "ChangeDate", "Author", "Field", "FieldType", "FromValue", "ToValue"},
+        {}
+    ),
+    
+    // Use the empty table if no changes were found
+    resultTable = if Table.IsEmpty(changesTable) or changesTable = null then 
+                    emptyTable 
+                  else 
+                    changesTable,
+    
+    // Add proper change type categorization
+    withChangeTypes = Table.AddColumn(
+        resultTable,
+        "ChangeType",
+        each 
+            if [Field] = "status" then "Status Change"
+            else if [Field] = fieldConfig[StoryPoints][id] then "Story Points Change"
+            else if [Field] = fieldConfig[Sprint][id] then "Sprint Assignment Change"
+            else if [Field] = fieldConfig[Team][id] then "Team Assignment Change"
+            else "Other Change",
+        type text
+    ),
+    
+    // Add column with change significance for sprint analysis
+    withSignificance = Table.AddColumn(
+        withChangeTypes,
+        "ChangeSignificance",
+        each 
+            if [ChangeType] = "Status Change" then
+                if Text.Contains([ToValue], "In Progress") then "Started Work"
+                else if Text.Contains([ToValue], "Done") or Text.Contains([ToValue], "Closed") or Text.Contains([ToValue], "Resolved") then "Completed Work"
+                else "Status Transition"
+            else if [ChangeType] = "Story Points Change" then
+                if [FromValue] = "" or [FromValue] = "null" or [FromValue] = "0" then "Initial Estimation"
+                else if Number.From([ToValue] ?? "0") > Number.From([FromValue] ?? "0") then "Increased Estimation"
+                else if Number.From([ToValue] ?? "0") < Number.From([FromValue] ?? "0") then "Decreased Estimation"
+                else "Same Estimation"
+            else if [ChangeType] = "Sprint Assignment Change" then
+                if [FromValue] = "" or [FromValue] = "null" then "Added to Sprint"
+                else if [ToValue] = "" or [ToValue] = "null" then "Removed from Sprint"
+                else "Moved Between Sprints"
+            else "Other Change",
+        type text
+    ),
+    
+    // Convert date column and sort by date
+    typedTable = Table.TransformColumnTypes(
+        withSignificance,
+        {{"ChangeDate", type datetimezone}}
+    ),
+    
+    sortedTable = Table.Sort(typedTable, {{"ChangeDate", Order.Ascending}})
+in
+    sortedTable
